@@ -2,6 +2,8 @@ import asyncio
 import os
 import shutil
 import tempfile
+import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
@@ -15,142 +17,101 @@ from chapter_scraper import extract_chapter_content, parse_chapter_number
 from playwright_worker import scrape_chapter_with_playwright
 from series_scraper import extract_series_profile, fetch_series_list
 
-app = FastAPI(title="AzoraMoon Full Scraper (Unified Async)")
+app = FastAPI(title="AzoraMoon Scraper API - Stable Version")
 
-# تم الاحتفاظ بـ ThreadPoolExecutor لعمليات ضغط الملفات (Zipping) لأنها تستهلك المعالج
+# استخدام ThreadPoolExecutor للعمليات التي تستهلك المعالج مثل الضغط
 executor = ThreadPoolExecutor(max_workers=5)
+
+def init_playwright():
+    """تتحقق من وجود متصفح Chromium وتقوم بتثبيته إذا لزم الأمر"""
+    print("🤖 Checking Playwright environment...")
+    try:
+        # تشغيل أمر التثبيت مع التبعيات لضمان عمله على Linux
+        subprocess.run([
+            sys.executable, "-m", "playwright", "install", "chromium", "--with-deps"
+        ], check=True)
+        print("✅ Playwright is ready to go!")
+    except Exception as e:
+        print(f"⚠️ Playwright setup warning: {e}")
+
+@app.on_event("startup")
+async def startup_event():
+    # تشغيل التحقق عند بدء تشغيل السيرفر
+    init_playwright()
 
 @app.get("/ping")
 async def ping():
-    return {"status": "ok", "message": "Server is running smoothly"}
+    return {"status": "ok", "environment": "production"}
 
-# --------------- قائمة السلاسل (Series List) ---------------
+# --- قائمة السلاسل ---
 @app.get("/series/list")
-async def series_list(
-    page_url: Optional[str] = Query(None, description="رابط صفحة السلسلة (اختياري)")
-):
+async def series_list(page_url: Optional[str] = Query(None)):
     url = page_url or "https://azoramoon.com/series"
-    # fetch_series_list هي دالة async في الأصل
     result = await fetch_series_list(url)
-    items = result.get("items", [])
-    return JSONResponse({"count": len(items), "items": items})
+    return JSONResponse(result)
 
-# --------------- الملف الشخصي للسلسلة (Series Profile) ---------------
+# --- الملف الشخصي للسلسلة ---
 @app.get("/series/profile")
-def series_profile(
-    url: str = Query(..., description="رابط السلسلة بالكامل")
-):
-    # هذه الدالة حالياً هي Wrapper متزامن (Sync) في ملف series_scraper
-    profile = extract_series_profile(url)
+async def series_profile(url: str = Query(...)):
+    # تشغيل الوظيفة المتزامنة في executor لتجنب حظر الـ Event Loop
+    loop = asyncio.get_event_loop()
+    profile = await loop.run_in_executor(executor, extract_series_profile, url)
     
-    # ترتيب الفصول رقمياً لضمان تجربة مستخدم أفضل
-    try:
-        chapters = profile.get("chapters") or []
-        def chap_key(c):
-            n = c.get("number")
-            if n is not None:
-                try:
-                    return float(n)
-                except:
-                    pass
-            return parse_chapter_number(c.get("title", ""), c.get("url", "")) or 1e9
-            
-        profile["chapters"] = sorted(chapters, key=chap_key)
-    except Exception:
-        pass
-        
+    # ترتيب الفصول
+    if "chapters" in profile:
+        profile["chapters"].sort(
+            key=lambda c: parse_chapter_number(c.get("title"), c.get("url")) or 0, 
+            reverse=True
+        )
     return JSONResponse(profile)
 
-# --------------- محتوى الفصل (Chapter Content) ---------------
+# --- محتوى الفصل (الصور) ---
 @app.get("/chapter/content")
 async def chapter_content(
-    url: str = Query(..., description="رابط الفصل لجلب الصور"),
-    cf: Optional[str] = Query(None, description="cf_clearance cookie"),
-    ua: Optional[str] = Query(None, description="User-Agent"),
-    playwright_fallback: bool = Query(True, description="استخدام Playwright كحل احتياطي"),
-    headless: bool = Query(True),
-    wait_after: float = Query(1.0)
+    url: str = Query(...),
+    cf: Optional[str] = Query(None),
+    ua: Optional[str] = Query(None),
+    playwright_fallback: bool = Query(True)
 ):
     try:
-        # استدعاء مباشر بـ await بفضل التعديلات في chapter_scraper
-        result = await extract_chapter_content(
-            url, cf, ua, playwright_fallback, headless, wait_after
-        )
+        result = await extract_chapter_content(url, cf, ua, playwright_fallback)
         return JSONResponse(result)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# --------------- تحميل الصور كملف ZIP ---------------
+# --- تحميل الصور ZIP ---
 @app.get("/chapter/download")
-async def chapter_download(
-    url: str = Query(...),
-    cf: Optional[str] = Query(None),
-    ua: Optional[str] = Query(None)
-):
-    # 1. جلب روابط الصور
+async def chapter_download(url: str = Query(...), cf: Optional[str] = Query(None), ua: Optional[str] = Query(None)):
     result = await extract_chapter_content(url, cf, ua)
-    images = result.get("images") or []
+    images = result.get("images", [])
     
     if not images:
         return JSONResponse({"error": "No images found"}, status_code=404)
 
-    tmpdir = tempfile.mkdtemp(prefix="azora_dl_")
-    headers = {"User-Agent": ua or "Mozilla/5.0"}
+    tmpdir = tempfile.mkdtemp()
+    
+    # تحميل الصور بشكل Async
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        tasks = []
+        for i, img_url in enumerate(images):
+            filename = f"{i:03d}.jpg"
+            path = os.path.join(tmpdir, filename)
+            tasks.append(client.get(img_url))
+        
+        responses = await asyncio.gather(*tasks, return_exceptions=True)
+        for i, resp in enumerate(responses):
+            if isinstance(resp, httpx.Response) and resp.status_code == 200:
+                with open(os.path.join(tmpdir, f"{i:03d}.jpg"), "wb") as f:
+                    f.write(resp.content)
 
-    # 2. تحميل الصور بشكل غير متزامن (Async Download)
-    async with httpx.AsyncClient(headers=headers, timeout=30.0) as client:
-        for idx, img_url in enumerate(images, start=1):
-            try:
-                # معالجة الامتداد
-                ext = os.path.splitext(img_url.split("?")[0])[1] or ".jpg"
-                if len(ext) > 5: ext = ".jpg"
-                
-                filename = f"{idx:03d}{ext}"
-                outpath = os.path.join(tmpdir, filename)
-                
-                resp = await client.get(img_url)
-                if resp.status_code == 200:
-                    with open(outpath, "wb") as f:
-                        f.write(resp.content)
-            except Exception:
-                continue
+    # إنشاء ملف ZIP
+    def make_zip():
+        zip_file = tempfile.mktemp(suffix=".zip")
+        shutil.make_archive(zip_file.replace(".zip", ""), 'zip', tmpdir)
+        return zip_file if zip_file.endswith(".zip") else zip_file + ".zip"
 
-    # 3. إنشاء ملف ZIP (في Thread منفصل لعدم تجميد السيرفر)
-    def create_zip(source_dir):
-        zip_base = tempfile.mktemp(suffix=".zip")
-        shutil.make_archive(zip_base.replace(".zip", ""), 'zip', source_dir)
-        return zip_base if zip_base.endswith(".zip") else zip_base + ".zip"
-
-    loop = asyncio.get_event_loop()
-    zip_path = await loop.run_in_executor(executor, create_zip, tmpdir)
-
-    return FileResponse(
-        zip_path, 
-        filename=f"chapter_{result.get('number', 'images')}.zip", 
-        media_type="application/zip"
-    )
-
-# --------------- Playwright المباشر (للتوافق) ---------------
-@app.get("/scrape/playwright")
-async def scrape_playwright(
-    url: str = Query(...),
-    cf: Optional[str] = Query(None),
-    ua: Optional[str] = Query(None),
-    headless: bool = Query(True),
-    wait_after: float = Query(1.0)
-):
-    loop = asyncio.get_event_loop()
-    try:
-        # تشغيل الوظيفة المتزامنة في Executor
-        result = await loop.run_in_executor(
-            executor,
-            scrape_chapter_with_playwright,
-            url, cf, ua, headless, wait_after
-        )
-        return JSONResponse(result)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    zip_path = await asyncio.get_event_loop().run_in_executor(executor, make_zip)
+    return FileResponse(zip_path, filename="chapter.zip")
 
 if __name__ == "__main__":
-    # تشغيل uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
