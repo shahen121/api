@@ -23,16 +23,32 @@ app = FastAPI(title="AzoraMoon Scraper API - Stable Version")
 executor = ThreadPoolExecutor(max_workers=5)
 
 def init_playwright():
-    """تتحقق من وجود متصفح Chromium وتقوم بتثبيته إذا لزم الأمر"""
+    """
+    تهيئة Playwright بمسار محلي (User-space) لتجنب مشاكل الصلاحيات.
+    يقوم هذا الكود بتحديد مسار التثبيت داخل مجلد المشروع وتشغيل التثبيت بدون dependecies للنظام.
+    """
     print("🤖 Checking Playwright environment...")
     try:
-        # تشغيل أمر التثبيت مع التبعيات لضمان عمله على Linux
+        # 1. تحديد مسار محلي لتخزين المتصفح داخل مجلد المشروع
+        local_browser_path = os.path.join(os.getcwd(), "playwright-browsers")
+        
+        # ضبط متغير البيئة ليستخدمه Playwright عند التشغيل
+        os.environ["PLAYWRIGHT_BROWSERS_PATH"] = local_browser_path
+        
+        print(f"📂 Setting Playwright path to: {local_browser_path}")
+
+        # 2. تشغيل أمر التثبيت (تمت إزالة --with-deps لتجنب طلب sudo)
+        # نقوم بتثبيت chromium فقط لتوفير المساحة
         subprocess.run([
-            sys.executable, "-m", "playwright", "install", "chromium", "--with-deps"
+            sys.executable, "-m", "playwright", "install", "chromium"
         ], check=True)
-        print("✅ Playwright is ready to go!")
+        
+        print("✅ Playwright installation completed successfully!")
+        
+    except subprocess.CalledProcessError as e:
+        print(f"❌ Error during Playwright installation: {e}")
     except Exception as e:
-        print(f"⚠️ Playwright setup warning: {e}")
+        print(f"⚠️ Unexpected error in Playwright setup: {e}")
 
 @app.on_event("startup")
 async def startup_event():
