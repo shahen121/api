@@ -7,10 +7,11 @@ from typing import Optional, List
 from concurrent.futures import ThreadPoolExecutor
 import tempfile, os, shutil, requests
 
-# existing scrapers / workers
-from series_scraper import extract_series_list, extract_series_profile
+# استيراد الوظائف المصححة من series_scraper
+# تم تغيير extract_series_list إلى fetch_series_list ليطابق الملف الأصلي
+from series_scraper import fetch_series_list, extract_series_profile
 from playwright_worker import scrape_chapter_with_playwright
-from chapter_scraper import extract_chapter_content, parse_chapter_number  # new file
+from chapter_scraper import extract_chapter_content, parse_chapter_number 
 
 app = FastAPI(title="AzoraMoon Full Scraper")
 
@@ -22,33 +23,39 @@ def ping():
 
 # --------------- list of series ---------------
 @app.get("/series/list")
-def series_list(page_url: Optional[str] = Query(None, description="Optional full series page URL. If omitted uses default /series")):
+async def series_list(page_url: Optional[str] = Query(None, description="Optional full series page URL. If omitted uses default /series")):
     url = page_url or "https://azoramoon.com/series"
-    items = extract_series_list(url)
+    
+    # بما أن fetch_series_list هي async، يجب استخدام await
+    # الوظيفة تعيد قاموساً (dict) يحتوي على القائمة داخل مفتاح "items"
+    result = await fetch_series_list(url)
+    items = result.get("items", [])
+    
     return JSONResponse({"count": len(items), "items": items})
 
 # --------------- series profile + chapters ---------------
 @app.get("/series/profile")
 def series_profile(url: str = Query(..., description="Full series URL (example https://azoramoon.com/series/nano-machine-s)")):
+    # هذه الوظيفة sync في ملف السكرابر لذا لا تحتاج await
     profile = extract_series_profile(url)
-    # try to normalize & sort chapters by numeric chapter number
+    
+    # محاولة ترتيب الفصول رقمياً
     try:
         chapters = profile.get("chapters") or []
         def chap_key(c):
-            # try parse number from the provided 'number' field, otherwise from title/url
             n = c.get("number")
             if n is not None:
                 try:
                     return float(n)
                 except:
                     pass
-            # fallback uses parse_chapter_number heuristic
             return parse_chapter_number(c.get("title",""), c.get("url","")) or 1e9
+            
         chapters_sorted = sorted(chapters, key=chap_key)
         profile["chapters"] = chapters_sorted
     except Exception:
-        # leave profile unchanged on failure
         pass
+        
     return JSONResponse(profile)
 
 # --------------- chapter images (smart) ---------------
@@ -92,9 +99,7 @@ async def chapter_download(
     try:
         headers = {"User-Agent": ua} if ua else {"User-Agent": "Mozilla/5.0"}
         for idx, img_url in enumerate(images, start=1):
-            # try to get extension from url
             ext = os.path.splitext(img_url.split("?")[0])[1] or ".jpg"
-            # sanitize extension
             if len(ext) > 8 or not ext.startswith("."):
                 ext = ".jpg"
             filename = f"{idx:03d}{ext}"
@@ -105,19 +110,17 @@ async def chapter_download(
                         with open(outpath, "wb") as fh:
                             shutil.copyfileobj(r.raw, fh)
             except Exception:
-                # skip failing images
                 pass
 
-        # make zip
         zip_base = tempfile.mktemp(suffix=".zip")
         shutil.make_archive(zip_base.replace(".zip",""), 'zip', tmpdir)
         zip_path = zip_base if zip_base.endswith(".zip") else zip_base + ".zip"
         return FileResponse(zip_path, filename="chapter_images.zip", media_type="application/zip")
     finally:
-        # keep files for a moment (or implement cleanup)
+        # يمكن إضافة تنظيف للملفات المؤقتة هنا لاحقاً
         pass
 
-# --------------- Playwright endpoint retained for backwards compatibility ---------------
+# --------------- Playwright endpoint ---------------
 @app.get("/scrape/playwright")
 async def scrape_playwright(
     url: str = Query(..., description="Chapter URL to scrape"),
