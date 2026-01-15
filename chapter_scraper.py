@@ -1,13 +1,40 @@
 # chapter_scraper.py
 import asyncio
+import re
+from typing import Optional, List, Dict, Any
+from urllib.parse import urlparse
 import scraper  # السكرابر الموحد الجديد
 from playwright_worker import scrape_chapter_with_playwright 
-from typing import Optional, List, Dict, Any
 
-# دالة مساعدة لحذف التكرار مع الحفاظ على الترتيب
+# تعبيرات نمطية للبحث عن رقم الفصل
+CHAPTER_RE_LIST = [
+    re.compile(r'chapter[\s\-_\/:]*([0-9]+(?:\.[0-9]+)?)', re.I),
+    re.compile(r'(^|\D)(\d+(?:\.\d+)?)(?:$|\D)', re.I),
+]
+
+# --- دالة تحليل رقم الفصل (هذه هي الدالة التي كانت مفقودة) ---
+def parse_chapter_number(title: Optional[str], url: Optional[str]) -> Optional[float]:
+    def try_find(s: str):
+        if not s: return None
+        for rx in CHAPTER_RE_LIST:
+            m = rx.search(s)
+            if m:
+                for g in m.groups()[::-1]:
+                    if g:
+                        try: return float(g)
+                        except: pass
+        return None
+
+    num = try_find(title or "")
+    if num is not None: return num
+    if url:
+        return try_find(urlparse(url).path)
+    return None
+
 def dedupe_preserve_order(items: List[str]) -> List[str]:
     return list(dict.fromkeys(items))
 
+# --- دالة جلب المحتوى (Async) ---
 async def extract_chapter_content(
     url: str,
     cf: Optional[str] = None,
@@ -25,34 +52,30 @@ async def extract_chapter_content(
         "note": ""
     }
 
-    # 1) المحاولة الأولى: استخدام الجلب السريع (Async Scraper with Cache)
     try:
-        # هنا نستخدم await لأن الدالة أصبحت async في scraper.py
         fast_res = await scraper.extract_images(url, ua=ua, cf_clearance=cf)
         if fast_res.get("images"):
             result["images"] = fast_res["images"]
             result["sources"].append("fast_static")
     except Exception as e:
-        result["note"] = f"Fast scrape error: {str(e)}"
+        result["note"] = f"Fast error: {str(e)}"
 
-    # 2) المحاولة الثانية: Playwright (إذا لم نجد صوراً وكان الخيار مفعلاً)
     if not result["images"] and playwright_fallback:
         try:
-            # بما أن playwright_worker هو sync، سنشغله في thread لعدم تعطيل الـ Event Loop
             loop = asyncio.get_event_loop()
             pw_res = await loop.run_in_executor(
-                None, 
-                scrape_chapter_with_playwright, 
+                None, scrape_chapter_with_playwright, 
                 url, cf, ua, headless, wait_after
             )
-            
             if pw_res.get("images"):
                 result["images"] = pw_res["images"]
                 result["sources"].append("playwright")
         except Exception as e:
-            result["note"] += f" | Playwright error: {str(e)}"
+            result["note"] += f" | PW error: {str(e)}"
 
     result["images"] = dedupe_preserve_order(result["images"])
     result["count"] = len(result["images"])
+    # استخراج رقم الفصل ليكون متاحاً في النتيجة
+    result["number"] = parse_chapter_number(None, url)
     
     return result
