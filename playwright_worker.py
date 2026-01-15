@@ -1,6 +1,6 @@
-# playwright_worker.py
 import json
 import time
+import os  # <-- تم إضافة مكتبة النظام
 from urllib.parse import urlparse
 from playwright.sync_api import sync_playwright
 
@@ -30,7 +30,7 @@ def _looks_like_chapter_image(u: str) -> bool:
     if not u:
         return False
     low = u.lower()
-    # قبول روابط storage, wp-manga, upload, chapter_ — ورفض روابط معالجة/thumbnail الخارجية (مثلاً wsrv.nl)
+    # قبول روابط storage, wp-manga, upload, chapter_ — ورفض روابط معالجة/thumbnail الخارجية
     allowed = ("wp-manga/data", "storage.azoramoon.com", "/upload/", "chapter_")
     blocked = ("wsrv.nl", "/_next/static", "like.", "love.", "default-avatar", "icon", "emoji", "reaction")
     if any(b in low for b in blocked):
@@ -43,9 +43,20 @@ def scrape_chapter_with_playwright(url: str, cf_clearance: str = None, ua: str =
     { "url": url, "images": [...], "sources": [...], "count": N, "error": ...? }
     """
     results = {"url": url, "images": [], "sources": [], "count": 0}
+
+    # --- [تعديل جديد] ---
+    # التأكد من توجيه Playwright للمجلد المحلي إذا كان موجوداً
+    # هذا يضمن أن السكربت يجد المتصفح الذي ثبتناه في main.py
+    local_browsers_path = os.path.join(os.getcwd(), "playwright-browsers")
+    if os.path.exists(local_browsers_path):
+        os.environ["PLAYWRIGHT_BROWSERS_PATH"] = local_browsers_path
+    # --------------------
+
     try:
         with sync_playwright() as p:
+            # هنا سيقوم Playwright تلقائياً بقراءة مسار المجلد من متغير البيئة
             browser = p.chromium.launch(headless=headless, args=["--no-sandbox"])
+            
             context_args = {}
             if ua:
                 context_args["user_agent"] = ua
