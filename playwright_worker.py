@@ -1,6 +1,6 @@
 import json
 import time
-import os  # <-- تم إضافة مكتبة النظام
+import os
 from urllib.parse import urlparse
 from playwright.sync_api import sync_playwright
 
@@ -30,7 +30,6 @@ def _looks_like_chapter_image(u: str) -> bool:
     if not u:
         return False
     low = u.lower()
-    # قبول روابط storage, wp-manga, upload, chapter_ — ورفض روابط معالجة/thumbnail الخارجية
     allowed = ("wp-manga/data", "storage.azoramoon.com", "/upload/", "chapter_")
     blocked = ("wsrv.nl", "/_next/static", "like.", "love.", "default-avatar", "icon", "emoji", "reaction")
     if any(b in low for b in blocked):
@@ -38,127 +37,107 @@ def _looks_like_chapter_image(u: str) -> bool:
     return any(a in low for a in allowed)
 
 def scrape_chapter_with_playwright(url: str, cf_clearance: str = None, ua: str = None, headless: bool = True, wait_after: float = 1.0):
-    """
-    Blocking function (sync). Returns dict:
-    { "url": url, "images": [...], "sources": [...], "count": N, "error": ...? }
-    """
     results = {"url": url, "images": [], "sources": [], "count": 0}
 
-    # --- [تعديل جديد] ---
-    # التأكد من توجيه Playwright للمجلد المحلي إذا كان موجوداً
-    # هذا يضمن أن السكربت يجد المتصفح الذي ثبتناه في main.py
+    # التأكد من المسار
     local_browsers_path = os.path.join(os.getcwd(), "playwright-browsers")
     if os.path.exists(local_browsers_path):
         os.environ["PLAYWRIGHT_BROWSERS_PATH"] = local_browsers_path
-    # --------------------
 
     try:
         with sync_playwright() as p:
-            # هنا سيقوم Playwright تلقائياً بقراءة مسار المجلد من متغير البيئة
-            browser = p.chromium.launch(headless=headless, args=["--no-sandbox"])
+            # 1. إعدادات تقليل الذاكرة القصوى
+            browser = p.chromium.launch(
+                headless=headless,
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",  # هام جداً للسيرفرات المحدودة
+                    "--disable-accelerated-2d-canvas",
+                    "--no-first-run",
+                    "--no-zygote",
+                    "--disable-gpu",
+                    "--single-process" # قد يساعد في تقليل العمليات
+                ]
+            )
             
             context_args = {}
             if ua:
                 context_args["user_agent"] = ua
             context = browser.new_context(**context_args)
 
-            # set cf_clearance cookie if provided
+            # 2. حظر تحميل الموارد الثقيلة لتوفير الرام
+            # سنمنع المتصفح من تحميل الصور والخطوط والميديا، نحن نحتاج الـ HTML فقط
+            def block_heavy_resources(route):
+                if route.request.resource_type in ["image", "media", "font", "stylesheet"]:
+                    route.abort()
+                else:
+                    route.continue_()
+
+            # تطبيق الحظر على كل الصفحات
+            # ملاحظة: إذا كان الموقع يعتمد على تحميل الصور لظهور الروابط في الـ DOM، قد نحتاج لإلغاء حظر "image"
+            # لكن في الغالب الروابط تكون موجودة في الكود (src) حتى لو لم يتم التحميل
+            
+            # في حالتك: AzoraMoon قد يحتاج لتحميل السكربتات، لذا لن نحظر السكربتات، فقط الصور
+            page = context.new_page()
+            page.route("**/*", block_heavy_resources)
+
             if cf_clearance:
                 parsed = urlparse(url)
                 domain = parsed.hostname
                 cookie = {"name": "cf_clearance", "value": cf_clearance, "domain": domain, "path": "/", "httpOnly": False, "secure": True}
                 context.add_cookies([cookie])
 
-            page = context.new_page()
-
             try:
-                page.goto(url, wait_until="networkidle", timeout=60000)
-            except Exception:
-                # محاولة ثانية بمهلة أطول
-                page.goto(url, wait_until="networkidle", timeout=120000)
-
-            time.sleep(wait_after)
-
-            # محاولة تمرير بسيط لتحميل lazy images
-            try:
-                page.evaluate(
-                    """() => {
-                        const step = Math.max(document.documentElement.clientHeight || 800, 800);
-                        let pos = 0;
-                        for (let i=0;i<8;i++){
-                            window.scrollTo(0, pos);
-                            pos += step;
-                        }
-                        return true;
-                    }"""
-                )
-                time.sleep(0.6)
+                page.goto(url, wait_until="domcontentloaded", timeout=45000) # استخدام domcontentloaded أسرع وأخف
             except Exception:
                 pass
 
-            # 1) imgs من DOM
+            time.sleep(wait_after)
+
+            # محاولة بسيطة للتمرير (بدون تحميل الصور فعلياً لأننا حظرناها، لكن لتفعيل السكربتات)
+            try:
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight);")
+                time.sleep(0.5)
+            except:
+                pass
+
+            # 1) استخراج من DOM
             dom_imgs = page.eval_on_selector_all("img", "els => els.map(e => e.getAttribute('src') || e.getAttribute('data-src') || '')")
             dom_imgs = [normalize_url(s, url) for s in dom_imgs if s]
-            dom_imgs = list(dict.fromkeys(dom_imgs))
+            
             if dom_imgs:
                 results["images"].extend(dom_imgs)
                 results["sources"].append("dom_img")
 
-            # 2) __NEXT_DATA__
+            # 2) محاولة JSON (خفيفة ولا تستهلك رام)
             try:
                 next_data = page.evaluate("() => { const s = document.getElementById('__NEXT_DATA__'); return s ? s.textContent : null }")
                 if next_data:
-                    try:
-                        obj = json.loads(next_data)
-                        found = []
-                        deep_search_for_images(obj, found)
-                        for f in found:
-                            f = normalize_url(f, url)
-                            if f not in results["images"]:
-                                results["images"].append(f)
-                        if found:
-                            results["sources"].append("next_data")
-                    except Exception:
-                        pass
-            except Exception:
+                    obj = json.loads(next_data)
+                    found = []
+                    deep_search_for_images(obj, found)
+                    for f in found:
+                        results["images"].append(normalize_url(f, url))
+            except:
                 pass
 
-            # 3) _next/data/{buildId}{path}.json
-            try:
-                buildId = page.evaluate("() => { const s = document.getElementById('__NEXT_DATA__'); if(!s) return null; try{ const j = JSON.parse(s.textContent); return j.buildId || null }catch(e){return null} }")
-                if buildId:
-                    path = urlparse(url).path
-                    next_json = f"{urlparse(url).scheme}://{urlparse(url).netloc}/_next/data/{buildId}{path}.json"
-                    try:
-                        res = page.request.get(next_json, timeout=60000)
-                        if res.ok:
-                            j = res.json()
-                            found2 = []
-                            deep_search_for_images(j, found2)
-                            for f in found2:
-                                f = normalize_url(f, url)
-                                if f not in results["images"]:
-                                    results["images"].append(f)
-                            if found2:
-                                results["sources"].append("next_json")
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-
-            # فلترة نهائية
-            filtered = []
-            for f in results["images"]:
-                if _looks_like_chapter_image(f):
-                    filtered.append(f)
-
-            filtered = list(dict.fromkeys(filtered))
-            results["images"] = filtered
-            results["count"] = len(filtered)
-
+            # تنظيف وإغلاق سريع
             context.close()
             browser.close()
+
+            # فلترة
+            filtered = []
+            seen = set()
+            for f in results["images"]:
+                if f not in seen and _looks_like_chapter_image(f):
+                    seen.add(f)
+                    filtered.append(f)
+            
+            results["images"] = list(filtered)
+            results["count"] = len(filtered)
+
     except Exception as e:
-        results["error"] = str(e)
+        results["error"] = f"LowMemoryMode Error: {str(e)}"
 
     return results
